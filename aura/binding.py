@@ -110,9 +110,10 @@ Notes:
 
 from __future__ import annotations
 
-from abc       import ABC, abstractmethod
+from abc import ABC, abstractmethod
 from threading import RLock
-from typing    import Any, Final, Self, final
+from typing import Any, Final, Self, final
+
 
 class Binder(ABC):
     """Define common binder state, graph binding, and invocation propagation.
@@ -296,8 +297,8 @@ class Binder(ABC):
             subsequent invocations rather than mutating the current iteration.
         """
 
-        invocation: set[int] | None = set[int]() if visited is None else visited
-        identity: int = id(self)
+        invocation = set() if visited is None else visited
+        identity = id(self)
 
         if identity in invocation:
             return

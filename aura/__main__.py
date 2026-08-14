@@ -13,16 +13,18 @@ class Example(OneWayBinder):
 def main() -> None:
     example: Example = Example.create()
 
-    debouncer: Debouncer = Debouncer.create(
-        example,
-        1.0,
-    )
+    # Attach the backup debouncer once. The application continues to invoke
+    # `example`, not the debouncer.
+    Debouncer.create(example, 1.0)
 
+    # Each access postpones Example.fire().
     for _ in range(5):
-        debouncer()
+        example()
         sleep(0.25)
 
+    # Example.fire() runs once after one full quiet second.
     sleep(1.25)
+
 
 if __name__ == '__main__':
     main()
