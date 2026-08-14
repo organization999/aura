@@ -1,0 +1,18 @@
+{
+  "venvPath": ".",
+  "venv": "env",
+  "stubPath": "aura/typing/stubs",
+  "include": [
+    "aura",
+    "tests",
+  ],
+  "executionEnvironments": [
+  ],
+  "exclude": [
+    "**/.*",
+    "**/.*/",
+    "**/.git",
+    "**/__pycache__",
+    "env"
+  ]
+}
