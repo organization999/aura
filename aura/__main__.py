@@ -11,13 +11,18 @@ class Example(OneWayBinder):
         print('Hello, World!')
 
 def main() -> None:
-
     example: Example = Example.create()
-    Debouncer.create(example, 1.0)
+
+    debouncer: Debouncer = Debouncer.create(
+        example,
+        1.0,
+    )
 
     for _ in range(5):
-        example()
-        sleep(1)
+        debouncer()
+        sleep(0.25)
+
+    sleep(1.25)
 
 if __name__ == '__main__':
     main()
