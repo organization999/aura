@@ -1,111 +1,108 @@
 """
-Provide factory-constructed one-way and reciprocal binder relationships.
+Provide factory-constructed binder relationships with pre-fire interception.
 
-This module defines a small graph-oriented invocation abstraction built around
-:class:`Binder`. A binder performs a local action through :meth:`Binder.fire`
-and may propagate the same invocation to one or more bound neighbors.
+This module defines the binding primitives used by :mod:`aura`.
 
-Bindings are represented internally as directed edges:
+A binder separates two concepts that are intentionally distinct:
+
+* Invocation through ``binder()`` represents activity directed at the binder.
+* :meth:`Binder.fire` performs the binder's local action.
+
+Normally an invocation eventually executes ``fire``. Before that happens,
+however, bound middleware is given an opportunity to intercept and consume the
+invocation.
+
+This distinction is required by middleware such as
+:class:`aura.debounce.Debouncer`. A backup-capable resource may continue to be
+used through its original public object::
+
+    database()
+
+while an attached debouncer observes that invocation before
+``database.fire()`` executes. The debouncer can consume the invocation, reset
+its quiet-period timer, and defer the backup until the resource has remained
+inactive for the configured duration.
+
+Binding model
+-------------
+
+Relationships are stored as directed graph edges.
+
+:class:`OneWayBinder` creates exactly one new object. Given an existing binder
+``B``::
+
+    A = ConcreteOneWayBinder.create(B)
+
+the factory installs::
 
     A -> B
 
-A :class:`OneWayBinder` creates exactly one new binder object and, when a
-``bindee`` is supplied, installs one directed edge from that new object to the
-existing bindee.
+:class:`TwoWayBinder` also creates exactly one new object. Given an existing
+binder ``A``::
 
-A :class:`TwoWayBinder` is a specialization of :class:`OneWayBinder`. It also
-creates exactly one new binder object, but reciprocal binding is implemented
-by applying the one-way operation in both directions:
+    B = ConcreteTwoWayBinder.create(A)
 
-    A -> B
+the factory installs the same one-way relationship in both directions::
+
     B -> A
+    A -> B
 
-Conceptually this is the same operation used to connect two vertices in an
-undirected graph. The existing bindee is reused; a second artificial endpoint
-is not allocated merely to establish reciprocity.
+This is equivalent to an undirected graph edge. The existing endpoint is
+reused; reciprocal construction never creates a second artificial endpoint.
 
-Both public binder families use factory-only construction. Normal construction
-syntax is rejected:
+Invocation model
+----------------
 
-    ConcreteBinder(...)
+:meth:`Binder._invoke` processes an invocation in this order:
 
-and callers must instead use the corresponding ``create`` factory:
+1. Mark the current binder as visited for the invocation.
+2. Offer the invocation to eligible bound interceptors.
+3. If any interceptor consumes the invocation, stop before ``fire``.
+4. Otherwise execute :meth:`Binder.fire`.
+5. Propagate the completed invocation to eligible bound neighbors.
 
-    ConcreteBinder.create(bindee, ...)
+An invocation-local set of object identities prevents reciprocal and longer
+cyclic graphs from repeatedly visiting the same object.
 
-The factory allocates the concrete instance with :func:`object.__new__`, then
-explicitly invokes the concrete class's initializer. Subclass-specific
-constructor state may follow ``bindee`` as positional or keyword arguments.
+Factory-only construction
+-------------------------
 
-Invocation propagation carries a set of visited object identities. This makes
-the propagation algorithm safe for reciprocal edges and for longer cyclic
-graphs, rather than merely suppressing an immediate two-node bounce.
+Normal construction of :class:`OneWayBinder` and :class:`TwoWayBinder`
+subclasses is rejected. Concrete objects must be created through ``create``::
+
+    resource = Resource.create()
+    middleware = Middleware.create(resource)
+
+Python has no language-level private ``__init__``. Factory-only construction
+is therefore enforced by guarding ``__new__``. The factory deliberately
+bypasses that guard with :func:`object.__new__` and then invokes the concrete
+initializer.
 
 Example:
-    Define a concrete one-way binder::
+    Define a resource whose local action writes a backup::
 
-        class Printer(OneWayBinder):
-
-            def __init__(
-                self,
-                bindee: Binder | None = None,
-                name: str = '',
-            ) -> None:
-                super().__init__(bindee)
-                self.name = name
+        class Database(OneWayBinder):
 
             def fire(self) -> None:
-                print(self.name)
+                print('writing backup')
 
-    Create a terminal endpoint and an upstream endpoint::
+    Create and invoke it::
 
-        downstream = Printer.create(None, 'downstream')
-        upstream = Printer.create(downstream, 'upstream')
+        database = Database.create()
+        database()
 
-        upstream()
-
-    Output::
-
-        upstream
-        downstream
-
-    A reciprocal endpoint reuses an existing binder instead of creating a
-    second endpoint::
-
-        class ReciprocalPrinter(TwoWayBinder):
-
-            def __init__(
-                self,
-                bindee: Binder | None = None,
-                name: str = '',
-            ) -> None:
-                super().__init__(bindee)
-                self.name = name
-
-            def fire(self) -> None:
-                print(self.name)
-
-        lhs = Printer.create(None, 'lhs')
-        rhs = ReciprocalPrinter.create(lhs, 'rhs')
-
-    The relationship is now equivalent to::
-
-        lhs -> rhs
-        rhs -> lhs
+    With no interceptor attached, ``Database.fire`` runs immediately.
 
 Notes:
-    Python does not provide a language-level private constructor. Factory-only
-    construction is therefore enforced by guarding ``__new__``. A caller that
-    deliberately invokes ``object.__new__(ConcreteBinder)`` can bypass normal
-    Python construction policy; this module prevents ordinary direct class
-    construction.
+    Binding membership uses object identity rather than equality.
 
-    Bindings use object identity rather than equality. A binder cannot bind to
-    itself, and adding the same directed edge more than once is idempotent.
+    A binder cannot bind to itself.
 
-    The binding collection is protected by a re-entrant lock. Invocation uses
-    a snapshot of the current neighbors so binding changes do not mutate a
-    collection while it is being traversed.
+    Adding the same directed edge more than once is idempotent.
+
+    Binding state is protected by :class:`threading.RLock`. Traversal uses an
+    immutable snapshot so relationship changes cannot mutate the collection
+    currently being traversed.
 """
 
 from __future__ import annotations
@@ -116,32 +113,30 @@ from typing import Any, Final, Self, final
 
 
 class Binder(ABC):
-    """Define common binder state, graph binding, and invocation propagation.
+    """Define shared binding, interception, firing, and propagation behavior.
 
-    ``Binder`` is the abstract root of the binding hierarchy. Each binder owns
-    zero or more directed edges to other binders. When invoked, the binder:
+    ``Binder`` is the abstract root of the relationship hierarchy.
 
-    1. Executes its local :meth:`fire` implementation.
-    2. Marks itself as visited for the current invocation.
-    3. Propagates to each bound neighbor that has not already participated in
-       the same invocation.
+    A binder owns zero or more outgoing relationships. Calling the binder
+    begins a new invocation. Before the binder executes its local
+    :meth:`fire` action, each eligible bound neighbor is offered an opportunity
+    to intercept that invocation through :meth:`_intercept`.
 
-    The visited set makes invocation safe for reciprocal and cyclic graphs.
+    If at least one neighbor consumes the invocation, ``fire`` is skipped and
+    ordinary post-fire propagation does not occur.
 
     Attributes:
         _bindee (Binder | None):
-            Compatibility view of the first bound neighbor. ``None`` is
-            returned when no neighbor exists. New code that needs every
-            neighbor should use :attr:`_bindees`.
+            Compatibility view of the first outgoing bindee. ``None`` means
+            that no outgoing relationship currently exists.
 
         _bindees (tuple[Binder, ...]):
-            Snapshot of all current outgoing binding targets.
+            Immutable snapshot of every outgoing bindee in insertion order.
 
     Notes:
-        Bindings are maintained as a collection rather than a single mutable
-        pointer. This allows reciprocal relationships to behave like undirected
-        graph edges and permits an existing binder to participate in more than
-        one relationship without discarding prior edges.
+        Interception and propagation are intentionally separate phases.
+        Interception happens before local work. Propagation happens after local
+        work.
     """
 
     def __init__(self) -> None:
@@ -150,55 +145,43 @@ class Binder(ABC):
         Returns:
             None:
                 Constructors initialize an existing instance and do not return
-                a separate value.
-
-        Notes:
-            Concrete relationship classes establish their edges after this
-            common state exists. Callers do not normally invoke this initializer
-            directly because :class:`OneWayBinder` and :class:`TwoWayBinder`
-            enforce factory-only construction.
+                a separate object.
         """
 
         self.__binding_lock: Final[RLock] = RLock()
         self.__bindees: list[Binder] = []
 
     def __call__(self) -> None:
-        """Begin a new invocation at this binder.
+        """Begin a new public invocation at this binder.
 
-        A fresh visited set is created for every public call. The current
-        binder then fires and the invocation is propagated through the bound
-        graph.
+        A fresh invocation-local visited set is created implicitly by
+        :meth:`_invoke`.
 
         Returns:
             None:
-                Invocation is performed for side effects only.
+                Invocation is processed entirely for side effects.
         """
 
         self._invoke()
 
     def _bind(self, bindee: Binder) -> None:
-        """Install one directed binding edge from this binder to ``bindee``.
-
-        The operation is the primitive used by both relationship types.
-        :class:`OneWayBinder` applies it once, while :class:`TwoWayBinder`
-        applies it once in each direction.
+        """Install one directed relationship from this binder to ``bindee``.
 
         Args:
             bindee (Binder):
-                Existing binder that should receive propagated invocations from
-                this binder.
+                Existing binder that should become an outgoing neighbor.
 
         Returns:
             None:
-                The graph relationship is modified in place.
+                The relationship is installed in place.
 
         Raises:
             ValueError:
-                Raised when ``bindee`` is the current binder itself.
+                Raised when ``bindee`` is this binder itself.
 
         Notes:
-            Adding the same object more than once is idempotent. Object identity
-            is used for duplicate detection rather than ``__eq__``.
+            Adding the same object twice is idempotent. Identity comparison is
+            used rather than ``__eq__``.
         """
 
         if bindee is self:
@@ -211,12 +194,11 @@ class Binder(ABC):
             self.__bindees.append(bindee)
 
     def _unbind(self, bindee: Binder) -> None:
-        """Remove one directed binding edge when it exists.
+        """Remove one directed relationship when present.
 
         Args:
             bindee (Binder):
-                Existing binder whose outgoing relationship from ``self`` should
-                be removed.
+                Existing outgoing neighbor to remove.
 
         Returns:
             None:
@@ -231,27 +213,29 @@ class Binder(ABC):
             ]
 
     def _bind_two_way(self, bindee: Binder) -> None:
-        """Connect this binder and ``bindee`` with two directed edges.
+        """Connect two existing endpoints in both directions.
 
-        Reciprocal binding is intentionally defined in terms of the same
-        one-way primitive used everywhere else:
+        Reciprocal binding is defined as two applications of the same
+        directional primitive::
 
             self   -> bindee
             bindee -> self
 
-        No additional binder objects are allocated.
-
         Args:
             bindee (Binder):
-                Existing endpoint to connect reciprocally to ``self``.
+                Existing endpoint to connect reciprocally.
 
         Returns:
             None:
-                Both directed relationships are installed in place.
+                Both directed relationships are installed.
 
         Raises:
             ValueError:
                 Raised when ``bindee`` is ``self``.
+
+        Notes:
+            If installation of the reverse edge fails, the forward edge is
+            removed before the exception is re-raised.
         """
 
         self._bind(bindee)
@@ -259,55 +243,131 @@ class Binder(ABC):
         try:
             bindee._bind(self)
         except BaseException:
-            # Preserve all-or-nothing behavior if a derived binder rejects the
-            # reverse relationship for any reason.
             self._unbind(bindee)
             raise
+
+    def _intercept(
+        self,
+        source: Binder,
+        visited: set[int],
+    ) -> bool:
+        """Optionally consume ``source`` before ``source.fire()`` executes.
+
+        The base implementation does not intercept anything.
+
+        Middleware subclasses override this method when they need to observe
+        and consume another binder's invocation before that binder performs its
+        local action.
+
+        Args:
+            source (Binder):
+                Binder whose invocation is about to execute local work.
+
+            visited (set[int]):
+                Invocation-local set containing identities that have already
+                participated in traversal.
+
+        Returns:
+            bool:
+                ``True`` when this binder consumed the invocation and
+                ``source.fire()`` must not execute; otherwise ``False``.
+
+        Notes:
+            Interceptors should not recursively invoke ``source`` from this
+            method. Deferred continuation should happen later through
+            :meth:`_invoke`, identifying the middleware object as ``source`` so
+            the reciprocal edge can be bypassed.
+        """
+
+        del source, visited
+        return False
 
     def _invoke(
         self,
         source: Binder | None = None,
         visited: set[int] | None = None,
     ) -> None:
-        """Fire this binder and propagate the current invocation through its graph.
+        """Process one invocation with interception before local firing.
+
+        The processing sequence is:
+
+        1. Create or reuse the invocation-local visited set.
+        2. Stop if this binder has already participated.
+        3. Mark this binder as visited.
+        4. Snapshot the current outgoing relationships.
+        5. Ask each eligible neighbor whether it intercepts this invocation.
+        6. Stop before :meth:`fire` if any interceptor consumed the call.
+        7. Execute :meth:`fire`.
+        8. Propagate to each eligible downstream neighbor.
 
         Args:
             source (Binder | None, optional):
-                Binder that immediately forwarded the invocation to this
-                instance. The source is skipped when forwarding to neighbors.
-                Defaults to ``None`` for a new public invocation.
+                Binder that directly forwarded this invocation. The source edge
+                is skipped during interception and post-fire propagation.
+                ``None`` means the current binder is the public origin.
+                Defaults to ``None``.
 
             visited (set[int] | None, optional):
-                Set containing ``id`` values for binders that have already
-                participated in the current invocation. ``None`` starts a new
-                invocation-local set.
+                Invocation-local set of binder identities that have already
+                participated. ``None`` creates a new set. Defaults to ``None``.
 
         Returns:
             None:
-                Invocation is performed entirely for side effects.
+                Processing is performed for side effects only.
+
+        Example:
+            For a backup resource reciprocally connected to a debouncer::
+
+                resource <-> debouncer
+
+            a public call behaves conceptually as::
+
+                resource()
+                    -> debouncer._intercept(resource, ...)
+                    -> reset timer
+                    -> return True
+                    -> resource.fire() is skipped
+
+            When the timer later expires, the debouncer resumes the resource
+            with itself as ``source``. The reciprocal edge is skipped and
+            ``resource.fire()`` is allowed to execute.
 
         Notes:
-            The visited set provides graph-wide cycle termination. This is
-            stronger than remembering only the immediately preceding binder,
-            which would terminate ``A <-> B`` but not a longer cycle such as
-            ``A -> B -> C -> A``.
+            All eligible interceptors are consulted even when an earlier
+            interceptor consumes the invocation. This permits multiple
+            middleware objects to observe one activity signal.
 
-            A snapshot of :attr:`_bindees` is captured after :meth:`fire`.
-            Bindings added or removed during one binder's local action affect
-            subsequent invocations rather than mutating the current iteration.
+            If any interceptor consumes the invocation, ordinary post-fire
+            propagation is skipped because the current binder never fired.
         """
 
-        invocation = set() if visited is None else visited
-        identity = id(self)
+        invocation: set[int] = set() if visited is None else visited
+        identity: int = id(self)
 
         if identity in invocation:
             return
 
         invocation.add(identity)
 
+        bindees: tuple[Binder, ...] = self._bindees
+        consumed: bool = False
+
+        for bindee in bindees:
+            if bindee is source:
+                continue
+
+            if id(bindee) in invocation:
+                continue
+
+            if bindee._intercept(self, invocation):
+                consumed = True
+
+        if consumed:
+            return
+
         self.fire()
 
-        for bindee in self._bindees:
+        for bindee in bindees:
             if bindee is source:
                 continue
 
@@ -318,16 +378,16 @@ class Binder(ABC):
 
     @property
     def _bindee(self) -> Binder | None:
-        """Return the first outgoing bindee for compatibility-oriented code.
+        """Return the first outgoing bindee.
 
         Returns:
             Binder | None:
-                First currently bound neighbor, or ``None`` when this binder has
-                no outgoing relationships.
+                First current outgoing neighbor, or ``None`` when this binder
+                has no outgoing relationships.
 
         Notes:
-            A binder may now have multiple neighbors. Code that needs the full
-            graph relationship should use :attr:`_bindees`.
+            A binder may have multiple neighbors. Use :attr:`_bindees` when the
+            complete relationship set is required.
         """
 
         bindees = self._bindees
@@ -339,7 +399,7 @@ class Binder(ABC):
 
         Returns:
             tuple[Binder, ...]:
-                Current directed binding targets in insertion order.
+                Current outgoing neighbors in insertion order.
         """
 
         with self.__binding_lock:
@@ -347,68 +407,39 @@ class Binder(ABC):
 
     @abstractmethod
     def fire(self) -> None:
-        """Perform the action local to this binder.
+        """Perform this binder's local action.
 
-        Concrete binders implement this method with the work that should occur
-        when the binder participates in an invocation. Implementations should
-        not manually traverse :attr:`_bindees`; graph propagation belongs to
-        :meth:`_invoke`.
+        Public invocation and local execution are deliberately separate.
+        Interceptors may prevent this method from running immediately.
+
+        Concrete resource classes place their actual work here. For a backup
+        resource, this method should perform the backup.
 
         Returns:
             None:
-                The action is performed for side effects.
+                Local work is performed for side effects.
         """
 
         ...
 
 
 class OneWayBinder(Binder):
-    """Create one factory-only binder with an optional outgoing relationship.
+    """Create one factory-only endpoint with an optional outgoing relationship.
 
-    ``OneWayBinder`` creates exactly one new endpoint. If an existing ``bindee``
-    is supplied, construction installs the directed edge::
+    ``OneWayBinder.create`` creates exactly one new object.
 
-        new -> bindee
+    Given an existing binder ``B``::
 
-    The bindee itself is never cloned, wrapped in a second artificial endpoint,
-    or modified to point back to the new binder.
+        A = ConcreteOneWayBinder.create(B)
 
-    Concrete subclasses provide their local action by implementing
-    :meth:`Binder.fire`.
+    the relationship becomes::
 
-    Example:
-        Define a concrete binder::
+        A -> B
 
-            class Printer(OneWayBinder):
+    ``B`` is reused and is not modified to point back to ``A``.
 
-                def __init__(
-                    self,
-                    bindee: Binder | None = None,
-                    name: str = '',
-                ) -> None:
-                    super().__init__(bindee)
-                    self.name = name
-
-                def fire(self) -> None:
-                    print(self.name)
-
-        Create two existing endpoints and connect one directionally::
-
-            rhs = Printer.create(None, 'rhs')
-            lhs = Printer.create(rhs, 'lhs')
-
-        Calling ``lhs`` produces::
-
-            lhs
-            rhs
-
-        Calling ``rhs`` produces only::
-
-            rhs
-
-    Notes:
-        Construction is factory-only. Normal ``ConcreteOneWayBinder(...)``
-        syntax raises :class:`TypeError`; use :meth:`create`.
+    Construction is factory-only. Normal concrete class construction raises
+    :class:`TypeError`.
     """
 
     @final
@@ -417,10 +448,12 @@ class OneWayBinder(Binder):
 
         Args:
             *args (Any):
-                Positional arguments supplied to an attempted direct
+                Positional arguments supplied to an attempted direct class
                 construction.
+
             **kwargs (Any):
-                Keyword arguments supplied to an attempted direct construction.
+                Keyword arguments supplied to an attempted direct class
+                construction.
 
         Returns:
             Self:
@@ -443,17 +476,16 @@ class OneWayBinder(Binder):
 
         Args:
             bindee (Binder | None, optional):
-                Existing binder that should receive invocations from this
-                endpoint. ``None`` leaves the new endpoint without outgoing
-                edges. Defaults to ``None``.
+                Existing downstream binder. ``None`` leaves the new endpoint
+                without outgoing relationships. Defaults to ``None``.
 
         Returns:
             None:
                 The already allocated endpoint is initialized.
 
         Notes:
-            Concrete subclasses may append additional constructor parameters
-            after ``bindee`` and should call ``super().__init__(bindee)``.
+            Concrete subclasses may append constructor parameters after
+            ``bindee`` and should forward ``bindee`` to this initializer.
         """
 
         super().__init__()
@@ -468,7 +500,7 @@ class OneWayBinder(Binder):
         *args: Any,
         **kwargs: Any,
     ) -> Self:
-        """Allocate and initialize exactly one directional binder endpoint.
+        """Allocate and initialize exactly one concrete one-way binder.
 
         Args:
             bindee (Binder | None, optional):
@@ -476,48 +508,24 @@ class OneWayBinder(Binder):
 
             *args (Any):
                 Additional positional arguments forwarded to the concrete
-                ``__init__`` implementation after ``bindee``.
+                ``__init__`` after ``bindee``.
 
             **kwargs (Any):
                 Additional keyword arguments forwarded unchanged to the
-                concrete ``__init__`` implementation.
+                concrete ``__init__``.
 
         Returns:
             Self:
-                Fully initialized instance of the concrete ``cls``.
+                Fully initialized concrete instance.
 
         Raises:
             TypeError:
-                May be raised when the supplied subclass-specific arguments do
-                not match the concrete initializer.
-
-        Example:
-            Given::
-
-                class Printer(OneWayBinder):
-
-                    def __init__(
-                        self,
-                        bindee: Binder | None = None,
-                        name: str = '',
-                    ) -> None:
-                        super().__init__(bindee)
-                        self.name = name
-
-                    def fire(self) -> None:
-                        print(self.name)
-
-            construct with::
-
-                endpoint = Printer.create(None, 'endpoint')
-                upstream = Printer.create(endpoint, 'upstream')
+                May be raised when subclass-specific arguments do not match the
+                concrete initializer.
 
         Notes:
-            The factory intentionally calls :func:`object.__new__` so the
-            guarded public ``__new__`` path is bypassed only here.
-
-            The factory creates one new object. ``bindee`` is always an existing
-            object supplied by the caller.
+            :func:`object.__new__` intentionally bypasses the guarded public
+            allocation path. Exactly one new binder object is allocated.
         """
 
         instance: Self = object.__new__(cls)
@@ -526,63 +534,26 @@ class OneWayBinder(Binder):
 
 
 class TwoWayBinder(OneWayBinder):
-    """Create one endpoint and connect it reciprocally to an existing bindee.
+    """Create one endpoint reciprocally connected to an existing endpoint.
 
-    ``TwoWayBinder`` is implemented as two one-way graph edges, not as two
-    newly allocated binder objects.
+    ``TwoWayBinder`` does not allocate two new objects.
 
-    Given an existing binder ``A``, creating ``B`` with ``A`` as its bindee
-    produces::
+    Given an existing endpoint ``A``::
+
+        B = ConcreteTwoWayBinder.create(A)
+
+    only ``B`` is newly allocated. The graph becomes::
 
         B -> A
         A -> B
 
-    which is equivalent to the undirected connection::
+    This is equivalent to the undirected relationship::
 
         A <-> B
 
-    Only ``B`` is newly allocated. ``A`` is the exact object supplied by the
-    caller.
-
-    Example:
-        Start with an existing endpoint::
-
-            lhs = Printer.create(None, 'lhs')
-
-        Define a reciprocal endpoint type::
-
-            class ReciprocalPrinter(TwoWayBinder):
-
-                def __init__(
-                    self,
-                    bindee: Binder | None = None,
-                    name: str = '',
-                ) -> None:
-                    super().__init__(bindee)
-                    self.name = name
-
-                def fire(self) -> None:
-                    print(self.name)
-
-        Connect one new endpoint to ``lhs``::
-
-            rhs = ReciprocalPrinter.create(lhs, 'rhs')
-
-        The resulting graph contains both edges::
-
-            lhs -> rhs
-            rhs -> lhs
-
-    Notes:
-        :meth:`create` intentionally mirrors
-        :meth:`OneWayBinder.create`. The difference is relationship
-        establishment, not object allocation:
-
-        * ``OneWayBinder.create`` installs ``new -> bindee``.
-        * ``TwoWayBinder.create`` installs ``new -> bindee`` and
-          ``bindee -> new``.
-
-        No second artificial endpoint is created.
+    The design is particularly useful for attached middleware because callers
+    can continue invoking the original endpoint while the middleware remains
+    reachable through the reverse edge.
     """
 
     @classmethod
@@ -592,16 +563,16 @@ class TwoWayBinder(OneWayBinder):
         *args: Any,
         **kwargs: Any,
     ) -> Self:
-        """Allocate one endpoint and bind it to an existing endpoint both ways.
+        """Allocate one endpoint and connect it to ``bindee`` both ways.
 
         Args:
             bindee (Binder | None, optional):
-                Existing endpoint to connect reciprocally to the newly allocated
-                object.
+                Existing opposite endpoint. Reciprocal construction requires a
+                non-``None`` bindee.
 
             *args (Any):
                 Additional positional arguments forwarded to the concrete
-                initializer after ``bindee``.
+                initializer.
 
             **kwargs (Any):
                 Additional keyword arguments forwarded unchanged to the
@@ -609,31 +580,26 @@ class TwoWayBinder(OneWayBinder):
 
         Returns:
             Self:
-                Newly allocated concrete endpoint. The supplied ``bindee`` is
-                reused and is not replaced or cloned.
+                The one newly allocated endpoint.
 
         Raises:
             ValueError:
-                Raised when ``bindee`` is ``None``. Reciprocal construction
-                requires an existing opposite endpoint.
+                Raised when no existing bindee is supplied.
 
             TypeError:
-                May be raised when subclass-specific constructor arguments do
-                not match the concrete initializer.
+                May be raised when subclass-specific constructor arguments are
+                incompatible with the concrete initializer.
 
-        Example:
-            Create an existing endpoint::
+        Notes:
+            The concrete initializer installs::
 
-                lhs = Printer.create(None, 'lhs')
+                new -> bindee
 
-            Add one reciprocal endpoint::
+            The factory then installs the reverse relationship::
 
-                rhs = ReciprocalPrinter.create(lhs, 'rhs')
+                bindee -> new
 
-            ``rhs`` is the only new object and these relationships hold::
-
-                rhs in lhs._bindees
-                lhs in rhs._bindees
+            No second new endpoint is created.
         """
 
         if bindee is None:
@@ -642,16 +608,12 @@ class TwoWayBinder(OneWayBinder):
             )
 
         instance: Self = object.__new__(cls)
-
-        # The concrete initializer applies the normal one-way edge:
-        #
-        #     instance -> bindee
         cls.__init__(instance, bindee, *args, **kwargs)
 
-        # Complete the undirected relationship by applying the same primitive
-        # in the reverse direction:
-        #
-        #     bindee -> instance
-        bindee._bind(instance)
+        try:
+            bindee._bind(instance)
+        except BaseException:
+            instance._unbind(bindee)
+            raise
 
         return instance

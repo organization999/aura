@@ -1,11 +1,12 @@
 """
-Provide quiet-period debouncing for deferred backups.
+Provide quiet-period debouncing for deferred backup operations.
 
-``Debouncer`` attaches to an existing :class:`binding.Binder` whose
-:meth:`binding.Binder.fire` method performs backup work.
+This module defines :class:`Debouncer`, middleware that attaches to an
+existing :class:`aura.binding.Binder` whose :meth:`~aura.binding.Binder.fire`
+method performs backup work.
 
-Callers continue using the original managed object. They do not call the
-debouncer.
+Callers continue using the original managed object. They do not need to call
+the debouncer directly.
 
 Example::
 
@@ -16,10 +17,12 @@ Example::
     database()
     database()
 
-Each ``database()`` call represents resource activity. The attached debouncer
-intercepts the call before ``Database.fire`` executes and resets a five-second
-quiet-period timer. Only after five uninterrupted seconds does the debouncer
-resume the database invocation, causing ``Database.fire`` to run once.
+Each call to ``database()`` represents activity on the managed resource. The
+attached debouncer intercepts the invocation before ``Database.fire`` executes
+and arms or resets a five-second quiet-period timer.
+
+Only after five uninterrupted seconds does the debouncer resume the managed
+binder and allow ``Database.fire`` to execute once.
 
 Conceptually::
 
@@ -32,26 +35,52 @@ Conceptually::
           v
     reset backup timer
           |
-          | quiet period expires
+          | no access for full interval
           v
     Database.fire()
           |
           v
        backup
 
-Construction does not arm a timer. Merely installing backup middleware must not
-produce a backup when the resource has never been accessed.
+Construction itself does not arm the timer. Merely attaching backup middleware
+must not create a backup for a resource that has never been accessed.
 
-The timer thread is non-daemon. This is deliberate for backup work: a normal
+Relationship
+------------
+
+:class:`Debouncer` derives from :class:`aura.binding.TwoWayBinder`. Creation
+adds one new debouncer endpoint and reuses the existing resource::
+
+    managed   -> debouncer
+    debouncer -> managed
+
+The ``managed -> debouncer`` edge gives the debouncer a pre-fire interception
+opportunity whenever the managed object is invoked.
+
+The ``debouncer -> managed`` edge allows timer expiration to resume the
+managed binder after the quiet interval.
+
+Timer behavior
+--------------
+
+The first intercepted resource invocation arms the timer. Every subsequent
+invocation before expiration cancels the previous timer generation and starts
+a full new interval.
+
+A monotonically increasing generation identifier is used in addition to
+:meth:`threading.Timer.cancel`. A stale timer callback therefore cannot invoke
+the managed binder after a newer generation has replaced it.
+
+Timer threads are non-daemon. This is intentional for backups: normal
 interpreter shutdown should not silently discard a pending backup.
 
 Notes:
-    This class observes invocations routed through the managed binder. It does
-    not automatically detect operating-system file activity performed outside
-    that abstraction.
+    This abstraction observes invocations routed through the managed binder.
+    It does not automatically observe operating-system file reads or writes
+    performed outside the binder abstraction.
 
     :func:`time.monotonic` is used for quiet-period calculations so wall-clock
-    corrections do not affect the debounce interval.
+    changes do not shorten or extend the debounce interval.
 """
 
 from __future__ import annotations
@@ -63,34 +92,43 @@ from typing import Final
 
 from binding import Binder, TwoWayBinder
 
-
 class Debouncer(TwoWayBinder):
-    """Intercept managed-resource activity and defer its local backup action.
+    """Intercept managed-resource activity and defer its backup action.
 
-    Creation establishes the reciprocal relationship::
+    A ``Debouncer`` owns one managed bindee. When that bindee is publicly
+    invoked, this object intercepts the invocation before the bindee's
+    :meth:`~aura.binding.Binder.fire` method executes.
 
-        managed   -> debouncer
-        debouncer -> managed
-
-    The ``managed -> debouncer`` edge lets the debouncer intercept every public
-    invocation before ``managed.fire()`` executes.
-
-    The ``debouncer -> managed`` edge lets timer expiration resume that managed
-    binder after the quiet period.
+    Every intercepted invocation restarts the quiet-period timer. The newest
+    timer generation eventually resumes the managed bindee after a full period
+    of inactivity.
 
     Attributes:
         duration (timedelta):
-            Configured quiet period.
+            Configured quiet-period duration.
 
         since (datetime | None):
-            UTC timestamp of the newest timer arm, or ``None`` before the first
-            managed-resource access.
+            UTC timestamp at which the current or most recent timer generation
+            was armed. ``None`` before the first managed-resource invocation.
 
         pending (bool):
             Whether a backup is currently waiting for the quiet period.
 
         remaining (timedelta):
-            Approximate quiet time remaining.
+            Approximate monotonic time remaining before the pending backup.
+
+    Example:
+        Attach a one-second backup delay::
+
+            database = Database.create()
+            Debouncer.create(database, 1.0)
+
+        Keep using the original resource::
+
+            database()
+            database()
+
+        One second after the final call, ``database.fire()`` executes once.
     """
 
     def __init__(
@@ -102,22 +140,29 @@ class Debouncer(TwoWayBinder):
 
         Args:
             bindee (Binder | None, optional):
-                Existing resource whose ``fire`` operation should be debounced.
+                Existing resource whose :meth:`Binder.fire` operation should
+                be deferred. :meth:`TwoWayBinder.create` requires this value to
+                be non-``None``.
 
             duration_seconds (float, optional):
-                Required quiet period in seconds. Defaults to ``5.0``.
+                Required quiet period in seconds. Every intercepted invocation
+                restarts the entire interval. Defaults to ``5.0``.
 
         Returns:
             None:
-                The existing allocation is initialized.
+                The already allocated debouncer is initialized.
 
         Raises:
             ValueError:
-                Raised when ``bindee`` is ``None`` or the duration is negative.
+                Raised when ``bindee`` is ``None`` or when
+                ``duration_seconds`` is negative.
 
         Notes:
-            No timer is armed during construction. The first intercepted access
-            starts the first backup timer.
+            No timer is started during construction. The first intercepted
+            resource invocation starts the first pending backup generation.
+
+            A zero duration is permitted. In that case expiration is scheduled
+            as soon as the timer thread can run.
         """
 
         if bindee is None:
@@ -154,17 +199,21 @@ class Debouncer(TwoWayBinder):
                 Binder whose local action is about to execute.
 
             visited (set[int]):
-                Invocation-local visited identities.
+                Invocation-local identities that have already participated.
 
         Returns:
             bool:
-                ``True`` when ``source`` is this debouncer's managed bindee;
-                otherwise ``False``.
+                ``True`` when ``source`` is this debouncer's managed bindee.
+                Returning ``True`` causes the source binder to stop before its
+                :meth:`Binder.fire` implementation executes. ``False`` is
+                returned for unrelated sources.
 
         Notes:
-            Consuming the invocation causes :class:`binding.Binder` to skip
-            ``source.fire()``. The backup is therefore postponed rather than
-            executed and merely observed afterward.
+            The visited set is accepted as part of the interception protocol
+            but does not need to be modified by this debouncer.
+
+            This is the operation that converts an ordinary managed-resource
+            invocation into a timer reset.
         """
 
         del visited
@@ -180,18 +229,19 @@ class Debouncer(TwoWayBinder):
         source: Binder | None = None,
         visited: set[int] | None = None,
     ) -> None:
-        """Safely treat direct debouncer invocation as a timer reset.
+        """Treat direct debouncer invocation as a timer reset.
 
-        Normal application code should call the managed resource, not the
-        debouncer. This override prevents an accidental direct debouncer call
-        from immediately propagating to and firing the managed resource.
+        Normal application code should invoke the managed resource rather than
+        this middleware object. This override nevertheless makes a direct
+        debouncer invocation safe: it resets the timer without immediately
+        propagating to the managed resource.
 
         Args:
             source (Binder | None, optional):
-                Immediate forwarding source, if any.
+                Binder that forwarded the invocation, if any.
 
             visited (set[int] | None, optional):
-                Invocation-local visited set, if any.
+                Invocation-local visited state, if any.
 
         Returns:
             None:
@@ -204,6 +254,9 @@ class Debouncer(TwoWayBinder):
     def fire(self) -> None:
         """Restart the quiet-period timer.
 
+        ``fire`` is the debouncer's local binder action. It never executes the
+        managed resource directly.
+
         Returns:
             None:
                 Pending backup state is updated.
@@ -212,19 +265,23 @@ class Debouncer(TwoWayBinder):
         self.reset()
 
     def reset(self) -> None:
-        """Arm or restart the complete quiet-period timer.
+        """Arm or restart the complete quiet-period interval.
 
-        Any previous timer is cancelled. A new generation identifier is
-        allocated so a stale timer racing with cancellation cannot perform the
-        backup.
+        Any current timer is cancelled. A new generation identifier, UTC
+        timestamp, monotonic deadline, and :class:`threading.Timer` are then
+        installed.
 
         Returns:
             None:
-                A new pending generation is installed.
+                Pending backup state is replaced by a new generation.
 
         Notes:
-            The timer is explicitly non-daemon so normal interpreter shutdown
-            waits for pending backup work rather than abandoning it.
+            :meth:`Timer.cancel` alone cannot eliminate a race with a timer
+            callback that is already starting. The generation identifier is
+            therefore validated again by :meth:`__expire`.
+
+            The timer is non-daemon so a normal interpreter shutdown waits for
+            a pending backup rather than abandoning it.
         """
 
         with self.__lock:
@@ -234,7 +291,7 @@ class Debouncer(TwoWayBinder):
                 previous.cancel()
 
             self.__generation += 1
-            generation = self.__generation
+            generation: int = self.__generation
 
             self.__since = datetime.now(timezone.utc)
             self.__deadline = monotonic() + self.__duration_seconds
@@ -250,14 +307,15 @@ class Debouncer(TwoWayBinder):
             timer.start()
 
     def cancel(self) -> None:
-        """Cancel a pending backup without removing the relationship.
+        """Cancel the currently pending backup.
+
+        Cancellation invalidates the current timer generation and clears the
+        pending timer state. The binding relationship remains installed, so a
+        later managed-resource invocation can arm another backup.
 
         Returns:
             None:
                 Pending timer state is cleared.
-
-        Notes:
-            A later managed-resource access can arm a new backup.
         """
 
         with self.__lock:
@@ -271,16 +329,19 @@ class Debouncer(TwoWayBinder):
                 timer.cancel()
 
     def flush(self) -> None:
-        """Immediately perform a pending backup.
+        """Immediately execute a pending backup once.
+
+        If no backup is pending, this operation does nothing. Otherwise the
+        pending timer is cancelled and invalidated before the managed binder is
+        resumed synchronously.
 
         Returns:
             None:
-                When a backup is pending, it is resumed synchronously exactly
-                once. With no pending backup, this method does nothing.
+                A pending backup is executed synchronously when present.
 
         Notes:
             ``flush`` is useful during controlled shutdown when waiting for the
-            rest of the quiet interval is undesirable.
+            remainder of the quiet interval is undesirable.
         """
 
         with self.__lock:
@@ -298,7 +359,7 @@ class Debouncer(TwoWayBinder):
         self.__resume_bindee()
 
     def __expire(self, generation: int) -> None:
-        """Resume the managed resource when this timer is still current.
+        """Resume the managed binder if this timer generation is still current.
 
         Args:
             generation (int):
@@ -306,13 +367,17 @@ class Debouncer(TwoWayBinder):
 
         Returns:
             None:
-                Stale timers exit. The current timer resumes the managed binder.
+                Stale generations return without side effects. The current
+                generation resumes the managed binder once.
 
         Notes:
-            The managed binder is resumed with this debouncer marked as both the
-            immediate source and an already-visited binder. The reciprocal
-            debouncer edge is therefore bypassed and the managed binder can
-            finally execute ``fire``.
+            Managed work begins only after the timer-state lock is released.
+
+            Resumption identifies this debouncer as the invocation source and
+            marks it as already visited. The reciprocal edge is therefore
+            skipped by the managed binder, allowing the managed
+            :meth:`Binder.fire` implementation to execute without immediately
+            resetting the timer again.
         """
 
         with self.__lock:
@@ -328,12 +393,12 @@ class Debouncer(TwoWayBinder):
         self.__resume_bindee()
 
     def __resume_bindee(self) -> None:
-        """Resume the managed binder while bypassing this interceptor.
+        """Resume the managed invocation while bypassing this interceptor.
 
         Returns:
             None:
-                The managed binder continues through its internal invocation
-                path and may execute its local ``fire`` operation.
+                The managed binder continues through its normal internal
+                invocation path and may execute :meth:`Binder.fire`.
         """
 
         self.__bindee._invoke(
@@ -343,22 +408,24 @@ class Debouncer(TwoWayBinder):
 
     @property
     def duration(self) -> timedelta:
-        """Return the configured quiet period.
+        """Return the configured quiet-period duration.
 
         Returns:
             timedelta:
-                Debounce interval supplied during creation.
+                Debounce interval supplied during construction.
         """
 
         return self.__duration
 
     @property
     def since(self) -> datetime | None:
-        """Return the newest timer-arm timestamp.
+        """Return the most recent timer-arm timestamp.
 
         Returns:
             datetime | None:
-                Timezone-aware UTC timestamp, or ``None`` before first access.
+                Timezone-aware UTC timestamp corresponding to the newest
+                intercepted activity, or ``None`` before the first timer is
+                armed.
         """
 
         with self.__lock:
@@ -366,11 +433,12 @@ class Debouncer(TwoWayBinder):
 
     @property
     def pending(self) -> bool:
-        """Return whether a backup is pending.
+        """Return whether a backup is waiting for the quiet period.
 
         Returns:
             bool:
-                ``True`` while a quiet-period timer is active.
+                ``True`` while a timer generation is pending; otherwise
+                ``False``.
         """
 
         with self.__lock:
@@ -378,11 +446,16 @@ class Debouncer(TwoWayBinder):
 
     @property
     def remaining(self) -> timedelta:
-        """Return the approximate quiet time remaining.
+        """Return the approximate monotonic time remaining.
 
         Returns:
             timedelta:
-                Non-negative remaining time, or zero when no backup is pending.
+                Non-negative remaining duration for the current generation.
+                ``timedelta(0)`` is returned when no backup is pending.
+
+        Notes:
+            This value is observational. The timer may expire immediately
+            after the property releases its lock.
         """
 
         with self.__lock:
