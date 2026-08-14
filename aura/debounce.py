@@ -90,7 +90,8 @@ from threading import Lock, Timer
 from time import monotonic
 from typing import Final
 
-from binding import Binder, TwoWayBinder
+from .binding import Binder, TwoWayBinder
+
 
 class Debouncer(TwoWayBinder):
     """Intercept managed-resource activity and defer its backup action.
